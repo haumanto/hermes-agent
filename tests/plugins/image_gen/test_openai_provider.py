@@ -102,6 +102,95 @@ class TestModelResolution:
         assert model_id == "gpt-image-2-low"
         assert meta["quality"] == "low"
 
+    def test_custom_model_id_passes_through(self, tmp_path):
+        """A model id that isn't a fixed gpt-image-2 tier is not silently
+        replaced by the default tier when configured through the
+        provider-scoped key — it passes through as-is so a custom
+        OpenAI-compatible endpoint's model id reaches the API."""
+        import yaml
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"image_gen": {"openai": {"model": "cx/gpt-5.5-image"}}})
+        )
+        model_id, meta = openai_plugin._resolve_model()
+        assert model_id == "cx/gpt-5.5-image"
+        assert meta["quality"] is None
+
+    def test_shared_top_level_unknown_model_falls_back_to_default(self, tmp_path):
+        """The shared, picker-written ``image_gen.model`` key stays on the
+        known-ids-only rule (sibling contract with openai-codex/meta-ai/krea
+        and with FAL, the other consumer of unknown ids in that key): an
+        unrecognized id there falls back to the default tier instead of
+        passing through."""
+        import yaml
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"image_gen": {"provider": "fal", "model": "fal-ai/flux-2/klein/9b"}})
+        )
+        model_id, meta = openai_plugin._resolve_model()
+        assert model_id == "gpt-image-2-medium"
+        assert meta["quality"] == "medium"
+
+
+# ── API key resolution / SSRF-adjacent key fallback ─────────────────────────
+
+
+class TestApiKeyResolution:
+    def test_model_api_key_fallback_requires_resolved_base_url(self, tmp_path, monkeypatch):
+        """Security regression: model.api_key must NOT be sent to the
+        default api.openai.com. The fallback is only allowed when an
+        explicit non-empty image endpoint base URL resolves."""
+        import yaml
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"api_key": "sk-sho...leak"}})
+        )
+        assert openai_plugin._resolve_api_key() == ""
+
+    def test_model_api_key_fallback_allowed_with_resolved_base_url(self, tmp_path, monkeypatch):
+        """Positive control: with an explicit image base_url configured,
+        the model.api_key fallback still works (unchanged behavior)."""
+        import yaml
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({
+                "model": {"api_key": "***"},
+                "image_gen": {"openai": {"base_url": "https://compat.example.com/v1"}},
+            })
+        )
+        assert openai_plugin._resolve_api_key() == "***"
+
+    def test_explicit_api_key_env_unaffected(self, tmp_path, monkeypatch):
+        """Explicit configured image api_key_env behavior is unchanged
+        regardless of base_url resolution."""
+        import yaml
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("MY_IMAGE_KEY", "***")
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"image_gen": {"openai": {"api_key_env": "MY_IMAGE_KEY"}}})
+        )
+        assert openai_plugin._resolve_api_key() == "***"
+
+    def test_openai_api_key_env_unaffected(self, monkeypatch):
+        """OPENAI_API_KEY behavior is unchanged regardless of base_url."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-standard")
+        assert openai_plugin._resolve_api_key() == "sk-standard"
+
+    def test_openai_base_url_env_not_consulted(self, tmp_path, monkeypatch):
+        """OPENAI_BASE_URL is never read: config.yaml is the single source
+        of truth for endpoint URLs, and a base URL is not a secret so it
+        has no env-var path. With no scoped base_url configured and no
+        OpenAI/scoped key, the provider must resolve unavailable rather
+        than silently pointing at whatever OPENAI_BASE_URL happens to be
+        set to with an unrelated credential."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://unrelated.example.com/v1")
+        (tmp_path / "config.yaml").write_text("model:\n  api_key: '***'\n")
+
+        assert openai_plugin._resolve_base_url() is None
+        assert openai_plugin.OpenAIImageGenProvider().is_available() is False
+
 
 # ── Generate ────────────────────────────────────────────────────────────────
 
@@ -239,4 +328,43 @@ class TestGenerate:
         assert result["image"].startswith("/")
         assert "example.com" not in result["image"]
         mock_save_url.assert_called_once()
+
+    def test_custom_model_generate(self, provider, tmp_path):
+        """Custom (non-tier) model path: raw model id reaches the API,
+        quality is omitted from request and result, the configured
+        base_url reaches the client, and the cache filename sanitizes
+        ``/`` to ``_``."""
+        import yaml
+
+        (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+            "image_gen": {"openai": {
+                "model": "cx/gpt-5.5-image",
+                "base_url": "https://compat.example.com/v1",
+            }},
+        }))
+
+        fake_client = MagicMock()
+        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
+        fake_openai = MagicMock()
+        fake_openai.OpenAI.return_value = fake_client
+
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            result = provider.generate("a cat", aspect_ratio="square")
+
+        assert result["success"] is True
+        assert result["model"] == "cx/gpt-5.5-image"
+
+        call_kwargs = fake_client.images.generate.call_args.kwargs
+        # Raw custom model id is sent as-is, not the fixed gpt-image-2 API model.
+        assert call_kwargs["model"] == "cx/gpt-5.5-image"
+        # No fixed quality tier for a custom model — omitted from request and result.
+        assert "quality" not in call_kwargs
+        assert "quality" not in result
+
+        client_kwargs = fake_openai.OpenAI.call_args.kwargs
+        assert client_kwargs["base_url"] == "https://compat.example.com/v1"
+
+        saved = Path(result["image"])
+        assert saved.name.startswith("openai_cx_gpt-5.5-image")
+        assert saved.exists()
 

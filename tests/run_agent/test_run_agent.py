@@ -1963,22 +1963,42 @@ class TestExecuteToolCalls:
 class TestRetryAfterCap:
     """#26293: the conversation loop owns rate-limit backoff and honors the
     Retry-After header up to a 600s ceiling (was 120s, which retried before
-    Tier-1 reset windows of ~171s and re-tripped the limit)."""
+    Tier-1 reset windows of ~171s and re-tripped the limit).
 
-    def _drive_once(self, agent, retry_after_value):
-        """Raise one 429 carrying ``Retry-After`` and capture the wait the loop
-        chose. Interrupt during the backoff sleep so the test doesn't actually
-        wait, and return the status string that reports the wait time."""
+    Also covers FailoverReason.overloaded (HTTP 503/529, agent/error_classifier.py
+    `if status_code in {503, 529}`): agent/turn_recovery.py's compute_error_backoff
+    honors the same header for provider-overloaded errors via the `is_overloaded`
+    flag wired from agent/turn_api_error.py, not just 429s.
+    """
 
-        class _RateLimitError(Exception):
-            status_code = 429
-            response = SimpleNamespace(headers={"retry-after": str(retry_after_value)})
+    def _drive_once(self, agent, retry_after_value, status_code=429):
+        """Raise one error carrying ``Retry-After`` and capture the wait the
+        loop chose. Interrupt during the backoff sleep so the test doesn't
+        actually wait, and return the status string that reports the wait
+        time.
+
+        ``status_code`` selects which real error path is exercised through
+        classify_api_error: 429 -> FailoverReason.rate_limit (is_rate_limited
+        branch, "Waiting ...s" status text); 503/529 ->
+        FailoverReason.overloaded via agent/error_classifier.py's
+        ``status_code in {503, 529}`` branch (non-rate-limited overloaded
+        branch, "Retrying in ...s" status text). Both status strings share
+        the "<wait>s (attempt" shape produced by turn_recovery.py, so a
+        single substring match below works for either.
+        """
+
+        class _HTTPError(Exception):
+            def __init__(self, code):
+                self.status_code = code
+                self.response = SimpleNamespace(headers={"retry-after": str(retry_after_value)})
 
             def __str__(self):
-                return "Error code: 429 - Rate limit exceeded."
+                if self.status_code == 429:
+                    return "Error code: 429 - Rate limit exceeded."
+                return f"Error code: {self.status_code} - Service overloaded."
 
         def _fake_api_call(api_kwargs):
-            raise _RateLimitError()
+            raise _HTTPError(status_code)
 
         agent._interruptible_api_call = _fake_api_call
         agent._persist_session = lambda *args, **kwargs: None
@@ -1990,19 +2010,36 @@ class TestRetryAfterCap:
         def _capture_status(msg, *args, **kwargs):
             captured.append(msg)
             # Break out of the incremental backoff sleep immediately rather
-            # than blocking for the full Retry-After window.
-            if "Waiting" in msg:
+            # than blocking for the full Retry-After window. Both the
+            # rate-limit ("Waiting Xs (attempt") and overloaded
+            # ("Retrying in Xs (attempt") status strings share this shape.
+            if "s (attempt" in msg:
                 agent._interrupt_requested = True
             return original_buffer(msg, *args, **kwargs)
 
         agent._buffer_status = _capture_status
         agent.run_conversation("hello")
-        return next((m for m in captured if "Waiting" in m), "")
+        return next((m for m in captured if "s (attempt" in m), "")
 
     def test_retry_after_under_cap_is_honored(self, agent):
         # 300s > old 120s cap but < new 600s cap → used verbatim.
         status = self._drive_once(agent, 300)
         assert "Waiting 300.0s" in status
+
+    def test_retry_after_under_cap_is_honored_503_overloaded(self, agent):
+        """HTTP 503 classifies as FailoverReason.overloaded and still honors
+        Retry-After (agent/error_classifier.py: `status_code in {503, 529}`;
+        agent/turn_recovery.py compute_error_backoff's `is_overloaded` gate,
+        wired from agent/turn_api_error.py: `classified.reason ==
+        FailoverReason.overloaded`)."""
+        status = self._drive_once(agent, 300, status_code=503)
+        assert "Retrying in 300.0s" in status
+
+    def test_retry_after_under_cap_is_honored_529_overloaded(self, agent):
+        """HTTP 529 (Anthropic's overloaded code) classifies identically to
+        503 and honors Retry-After through the same overloaded branch."""
+        status = self._drive_once(agent, 300, status_code=529)
+        assert "Retrying in 300.0s" in status
 
 
 

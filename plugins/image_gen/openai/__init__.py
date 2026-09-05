@@ -13,12 +13,95 @@ from agent.secret_scope import get_secret
 from agent.image_gen_provider import DEFAULT_ASPECT_RATIO, resolve_aspect_ratio, success_response
 from plugins.image_gen._common import (
     GPT_IMAGE_2_API_MODEL as API_MODEL, GPT_IMAGE_2_DEFAULT as DEFAULT_MODEL, GPT_IMAGE_2_TIERS,
-    StaticImageGenProvider, collect_source_images, error_factory, import_openai, materialize_image,
-    openai_importable, prompt_required_error, resolve_static_model, size_for)
+    StaticImageGenProvider, collect_source_images, error_factory, import_openai,
+    load_image_gen_config, materialize_image, openai_importable, prompt_required_error,
+    resolve_static_model, size_for)
 
 logger = logging.getLogger(__name__)
 
+# Metadata for a model id that isn't one of the fixed gpt-image-2 tiers —
+# i.e. a custom model on an OpenAI-compatible endpoint (see _resolve_base_url).
+_CUSTOM_MODEL_META: Dict[str, Any] = {
+    "display": "Provider-defined image model", "speed": "provider-defined",
+    "strengths": "provider-defined", "price": "varies", "quality": None,
+}
+
+
+def _resolve_base_url() -> Optional[str]:
+    """Resolve an optional OpenAI-compatible API base URL.
+
+    Scoped to ``image_gen.openai.base_url`` only. No top-level
+    ``image_gen.base_url`` and no ``OPENAI_BASE_URL`` env fallback: repo
+    policy treats config.yaml as the single source of truth for endpoint
+    URLs (``runtime_provider_backends.py``) and ``.env`` is secrets-only,
+    so a base URL — not a secret — has no env-var path here.
+    """
+    cfg = load_image_gen_config()
+    openai_cfg = cfg.get("openai") if isinstance(cfg.get("openai"), dict) else {}
+    value = openai_cfg.get("base_url") if isinstance(openai_cfg, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value.strip().rstrip("/")
+    return None
+
+
+def _resolve_api_key() -> str:
+    """Resolve the key for OpenAI or an OpenAI-compatible image endpoint."""
+    cfg = load_image_gen_config()
+    openai_cfg = cfg.get("openai") if isinstance(cfg.get("openai"), dict) else {}
+    key_env = openai_cfg.get("api_key_env") if isinstance(openai_cfg, dict) else None
+    if isinstance(key_env, str) and key_env.strip():
+        key = get_secret(key_env.strip()) or ""
+        if key:
+            return key
+
+    key = get_secret("OPENAI_API_KEY") or ""
+    if key:
+        return key
+
+    # Existing Hermes custom providers may keep their key in model config.
+    # Reuse it in memory instead of duplicating a credential into another
+    # .env — but ONLY when an explicit non-empty image endpoint base URL is
+    # configured. Without a resolved base URL this key would otherwise be
+    # sent straight to the default api.openai.com, leaking a credential
+    # meant for a different (often OpenAI-compatible but non-OpenAI)
+    # endpoint to OpenAI itself.
+    if _resolve_base_url():
+        try:
+            from hermes_cli.config import load_config
+
+            model_cfg = load_config().get("model")
+            if isinstance(model_cfg, dict):
+                key = str(model_cfg.get("api_key") or "").strip()
+                if key:
+                    return key
+        except Exception as exc:
+            logger.debug("Could not resolve image API key from model config: %s", exc)
+    return ""
+
+
 def _resolve_model() -> Tuple[str, Dict[str, Any]]:
+    """Decide model + quality metadata.
+
+    Custom passthrough (a model id outside the fixed gpt-image-2 tiers) is
+    scoped to provider-owned keys only: ``OPENAI_IMAGE_MODEL`` env and
+    ``image_gen.openai.model``. The shared top-level ``image_gen.model``
+    key is picker-written and shared across providers (e.g. FAL reads
+    unknown ids from it), so it keeps the ``resolve_static_model``
+    known-ids-only rule and falls back to ``DEFAULT_MODEL`` for an
+    unrecognized id there.
+    """
+    env_override = (os.environ.get("OPENAI_IMAGE_MODEL") or "").strip()
+    if env_override:
+        return env_override, GPT_IMAGE_2_TIERS.get(env_override, _CUSTOM_MODEL_META)
+
+    cfg = load_image_gen_config()
+    openai_cfg = cfg.get("openai") if isinstance(cfg.get("openai"), dict) else {}
+    if isinstance(openai_cfg, dict):
+        value = openai_cfg.get("model")
+        if isinstance(value, str) and value.strip():
+            candidate = value.strip()
+            return candidate, GPT_IMAGE_2_TIERS.get(candidate, _CUSTOM_MODEL_META)
+
     return resolve_static_model(
         GPT_IMAGE_2_TIERS, DEFAULT_MODEL, env_var="OPENAI_IMAGE_MODEL", config_key="openai")
 
@@ -70,7 +153,7 @@ class OpenAIImageGenProvider(StaticImageGenProvider):
         key="OPENAI_API_KEY", prompt="OpenAI API key", url="https://platform.openai.com/api-keys")
 
     def is_available(self) -> bool:
-        return bool(get_secret("OPENAI_API_KEY")) and openai_importable()
+        return bool(_resolve_api_key()) and openai_importable()
 
     def capabilities(self) -> Dict[str, Any]:
         # images.edit() accepts up to 16 source images.
@@ -85,7 +168,7 @@ class OpenAIImageGenProvider(StaticImageGenProvider):
         aspect = resolve_aspect_ratio(aspect_ratio)
         if not prompt:
             return prompt_required_error("openai", aspect)
-        api_key = get_secret("OPENAI_API_KEY")
+        api_key = _resolve_api_key()
         if not api_key:
             return error_factory("openai", aspect)(
                 "OPENAI_API_KEY not set. Run `hermes tools` → Image "
@@ -101,12 +184,22 @@ class OpenAIImageGenProvider(StaticImageGenProvider):
         sources = collect_source_images(image_url, reference_image_urls, limit=16)
         is_edit = bool(sources)
         fail = error_factory("openai", aspect, model=tier_id, prompt=prompt)
-        client = openai.OpenAI(api_key=api_key)
+        base_url = _resolve_base_url()
+        client_kwargs: Dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        client = openai.OpenAI(**client_kwargs)
 
         # gpt-image-2 returns b64_json unconditionally and REJECTS
         # ``response_format`` as an unknown parameter. Don't send it.
-        request: Dict[str, Any] = dict(
-            model=API_MODEL, prompt=prompt, size=size, n=1, quality=meta["quality"])
+        # Known tiers all hit the single underlying API model (API_MODEL)
+        # with a quality knob — gpt-image-2-low/medium/high are NOT valid
+        # OpenAI model IDs. Only an unrecognized (provider-defined /
+        # custom-endpoint) model id is sent to the API as-is.
+        api_model = API_MODEL if tier_id in GPT_IMAGE_2_TIERS else tier_id
+        request: Dict[str, Any] = dict(model=api_model, prompt=prompt, size=size, n=1)
+        if meta.get("quality"):
+            request["quality"] = meta["quality"]
         if is_edit:
             try:
                 files = [_named_bytes_io(ref) for ref in sources]
@@ -126,11 +219,13 @@ class OpenAIImageGenProvider(StaticImageGenProvider):
         first = data[0]
         image_ref, err = materialize_image(
             getattr(first, "b64_json", None), getattr(first, "url", None),
-            prefix=f"openai_{tier_id}", label="OpenAI", provider="openai",
+            prefix=f"openai_{tier_id.replace('/', '_')}", label="OpenAI", provider="openai",
             model=tier_id, prompt=prompt, aspect=aspect, log=logger)
         if err:
             return err
-        extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
+        extra: Dict[str, Any] = {"size": size}
+        if meta.get("quality"):
+            extra["quality"] = meta["quality"]
         if getattr(first, "revised_prompt", None):
             extra["revised_prompt"] = first.revised_prompt
         return success_response(
